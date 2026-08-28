@@ -1,0 +1,4 @@
+BM25 (Best Matching 25) is a ranking function used by search engines to estimate the relevance of documents to a
+given search query. It is based on a bag-of-words retrieval model and takes into account term frequency, inverse
+document frequency, and document length normalization. Because BM25 is purely lexical, it does not understand
+synonyms or paraphrases, which is why combining it with dense embeddings often improves overall retrieval quality.

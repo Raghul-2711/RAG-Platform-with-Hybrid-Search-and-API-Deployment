@@ -1,0 +1,9 @@
+flask==3.0.3
+rank_bm25==0.2.2
+numpy==1.26.4
+sentence-transformers==3.0.1
+torch==2.3.1
+# Optional — only needed if you set LLM_PROVIDER=anthropic or openai
+anthropic==0.34.2
+openai==1.40.0
+python-dotenv==1.0.1

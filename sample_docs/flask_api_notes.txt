@@ -1,0 +1,3 @@
+Flask is a lightweight Python web framework commonly used to expose machine learning models and retrieval pipelines
+as REST APIs. A typical deployment pattern loads the model and any indexes once at startup, then serves requests
+through simple JSON endpoints, keeping cold-start latency low while allowing horizontal scaling behind a load balancer.

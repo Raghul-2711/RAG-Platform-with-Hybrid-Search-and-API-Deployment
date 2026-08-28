@@ -1,0 +1,31 @@
+# Virtual environments
+.venv/
+.venv-1/
+venv/
+
+# Environment variables / secrets
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# VS Code
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# Generated RAG storage
+storage/
+
+# Build files
+build/
+dist/
+*.egg-info/
+
+# Model/cache files
+.cache/

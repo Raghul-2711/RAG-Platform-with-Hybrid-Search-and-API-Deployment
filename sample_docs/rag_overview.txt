@@ -1,0 +1,8 @@
+Retrieval-Augmented Generation (RAG) is a technique that combines information retrieval with text generation.
+A RAG system first retrieves relevant documents from a knowledge base, then feeds those documents to a language model
+as context so it can generate an accurate, grounded answer. This reduces hallucination compared to asking a language
+model a question with no supporting context.
+
+Hybrid search combines two retrieval methods: sparse keyword search (such as BM25) and dense vector search
+(embeddings). BM25 is excellent at matching exact keywords and rare terms, while dense embeddings capture semantic
+meaning, so a hybrid approach usually retrieves better results than either method alone.
