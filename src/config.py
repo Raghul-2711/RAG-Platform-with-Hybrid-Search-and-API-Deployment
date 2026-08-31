@@ -4,6 +4,9 @@ All tunable parameters live here so nothing is hard-coded deep inside the pipeli
 """
 
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # --- Paths ---
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -31,6 +34,7 @@ TOP_K = int(os.environ.get("TOP_K", "5"))
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "none")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-4-6")
 
 os.makedirs(INDEX_DIR, exist_ok=True)
