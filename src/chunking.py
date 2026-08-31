@@ -73,6 +73,22 @@ def load_documents(docs_dir: str) -> List[tuple]:
 
 def build_chunks_from_dir(docs_dir: str, chunk_size: int, overlap: int) -> List[Chunk]:
     all_chunks = []
+
     for fname, text in load_documents(docs_dir):
-        all_chunks.extend(chunk_text(text, fname, chunk_size, overlap))
+        chunks = chunk_text(text, fname, chunk_size, overlap)
+        total_chunks = len(chunks)
+
+        file_type = os.path.splitext(fname)[1].lower().lstrip(".")
+
+        for chunk in chunks:
+            chunk.metadata.update(
+                {
+                    "document_name": fname,
+                    "file_type": file_type,
+                    "total_chunks": total_chunks,
+                }
+            )
+
+        all_chunks.extend(chunks)
+
     return all_chunks
