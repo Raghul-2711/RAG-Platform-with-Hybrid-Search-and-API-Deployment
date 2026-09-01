@@ -4,7 +4,7 @@ Ingestion entry point.
 Usage:
     python ingest.py
 
-Reads every .txt/.md file from sample_docs/, chunks it, builds a BM25 index
+Reads every supported document from sample_docs/, chunks it, builds a BM25 index
 and a dense embedding index, and persists all three (+ the docstore) to
 storage/ so app.py can load them at request time without re-embedding.
 """
@@ -23,7 +23,10 @@ def main():
     chunks = build_chunks_from_dir(config.DOCS_DIR, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
 
     if not chunks:
-        print(f"No .txt/.md files found in {config.DOCS_DIR}. Add some documents and re-run.")
+        print(
+            f"No supported documents found in {config.DOCS_DIR}. "
+            "Add some documents and re-run."
+        )
         sys.exit(1)
 
     print(f"Built {len(chunks)} chunks from the source documents.")
