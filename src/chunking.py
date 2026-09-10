@@ -7,8 +7,8 @@ the dedicated loader layer in src/loaders/.
 
 from dataclasses import dataclass, field
 from typing import List
+import hashlib
 import os
-import uuid
 
 from .loaders import (
     TextLoader,
@@ -27,6 +27,30 @@ class Chunk:
     metadata: dict = field(default_factory=dict)
 
 
+def _create_stable_chunk_id(
+    source: str,
+    chunk_index: int,
+    metadata: dict,
+) -> str:
+    """
+    Create a deterministic chunk ID.
+
+    The same document/page/chunk position produces the same ID
+    across repeated index rebuilds.
+    """
+    page_number = metadata.get("page_number", "")
+    slide_number = metadata.get("slide_number", "")
+
+    identity = (
+        f"{source}|"
+        f"page={page_number}|"
+        f"slide={slide_number}|"
+        f"chunk={chunk_index}"
+    )
+
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+
+
 def chunk_text(
     text: str,
     source: str,
@@ -37,12 +61,14 @@ def chunk_text(
     """
     Split text into overlapping word-based chunks.
 
-    Optional metadata from the document loader is copied into every
-    resulting chunk so information such as PDF page numbers and
-    PPTX slide numbers is preserved.
+    Chunk IDs are deterministic so evaluation and retrieval remain
+    reproducible across index rebuilds.
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
+
+    if overlap < 0:
+        raise ValueError("overlap must be >= 0")
 
     if overlap >= chunk_size:
         raise ValueError("overlap must be smaller than chunk_size")
@@ -66,10 +92,17 @@ def chunk_text(
 
         chunk_metadata = dict(base_metadata)
         chunk_metadata["word_count"] = len(chunk_words)
+        chunk_metadata["chunk_index"] = idx
+
+        chunk_id = _create_stable_chunk_id(
+            source=source,
+            chunk_index=idx,
+            metadata=chunk_metadata,
+        )
 
         chunks.append(
             Chunk(
-                id=str(uuid.uuid4()),
+                id=chunk_id,
                 text=chunk_str,
                 source=source,
                 chunk_index=idx,
