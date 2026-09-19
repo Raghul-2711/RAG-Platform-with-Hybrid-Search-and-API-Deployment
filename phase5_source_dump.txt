@@ -810,6 +810,7 @@ python-pptx==0.6.23
 anthropic==0.34.2
 openai==1.40.0
 python-dotenv==1.0.1
+google-genai
 
 ============================================================
 FILE: .\src\config.py

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Flask REST API for the Enterprise RAG Platform.
 
 Endpoints:
