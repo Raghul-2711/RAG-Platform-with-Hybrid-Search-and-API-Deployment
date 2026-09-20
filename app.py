@@ -497,6 +497,9 @@ def _select_content_aware_results(
     Suppress bibliography chunks for normal questions.
 
     Bibliography remains fully eligible for reference-oriented queries.
+
+    Each result is enriched with its DocStore metadata so downstream
+    reranking can make content-aware decisions.
     """
 
     reference_query = _is_reference_query(question)
@@ -505,7 +508,9 @@ def _select_content_aware_results(
     content_results = []
 
     for result in results:
-        chunk = store.get(result["chunk_id"])
+        chunk = store.get(
+            result["chunk_id"]
+        )
 
         metadata = {}
 
@@ -514,13 +519,40 @@ def _select_content_aware_results(
                 chunk.metadata or {}
             )
 
+        enriched_result = {
+            **result,
+            "metadata": metadata,
+        }
+
         if metadata.get("content_type") == "bibliography":
-            bibliography_results.append(result)
+            bibliography_results.append(
+                enriched_result
+            )
         else:
-            content_results.append(result)
+            content_results.append(
+                enriched_result
+            )
 
     if reference_query:
-        selected = results[:top_k]
+        selected = (
+            [
+                {
+                    **result,
+                    "metadata": (
+                        dict(
+                            store.get(
+                                result["chunk_id"]
+                            ).metadata or {}
+                        )
+                        if store.get(
+                            result["chunk_id"]
+                        ) is not None
+                        else {}
+                    ),
+                }
+                for result in results
+            ]
+        )[:top_k]
     else:
         selected = (
             content_results + bibliography_results
@@ -672,7 +704,10 @@ def _build_sources(hits):
             "rank": rank,
             "source": source,
             "location": location,
-            "score": hit.get("rerank_score", hit.get("score")),
+            "score": hit.get(
+                "rerank_score",
+                hit.get("score"),
+            ),
             "chunk_id": hit.get("chunk_id"),
         }
 
@@ -832,8 +867,15 @@ def ingest():
                 "Supported formats: TXT, MD, PDF, DOCX, PPTX."
             )
 
-        chunk_ids = [chunk.id for chunk in chunks]
-        texts = [chunk.text for chunk in chunks]
+        chunk_ids = [
+            chunk.id
+            for chunk in chunks
+        ]
+
+        texts = [
+            chunk.text
+            for chunk in chunks
+        ]
 
         if len(chunk_ids) != len(set(chunk_ids)):
             raise RuntimeError(
@@ -841,6 +883,7 @@ def ingest():
             )
 
         bm25 = BM25Index()
+
         bm25.build(
             chunk_ids,
             texts,
@@ -860,11 +903,20 @@ def ingest():
         )
 
         store = DocStore()
+
         store.add(chunks)
 
-        bm25.save(config.BM25_INDEX_PATH)
-        embed.save(config.EMBED_INDEX_PATH)
-        store.save(config.DOCSTORE_PATH)
+        bm25.save(
+            config.BM25_INDEX_PATH
+        )
+
+        embed.save(
+            config.EMBED_INDEX_PATH
+        )
+
+        store.save(
+            config.DOCSTORE_PATH
+        )
 
         retriever = _create_retriever(
             bm25,
@@ -880,7 +932,10 @@ def ingest():
             }
         )
 
-        elapsed = time.perf_counter() - start_time
+        elapsed = (
+            time.perf_counter()
+            - start_time
+        )
 
         _ingestion_state.update(
             {
@@ -901,7 +956,10 @@ def ingest():
                 "request_id": request.request_id,
                 "chunks_indexed": len(chunks),
                 "documents_indexed": len(
-                    set(chunk.source for chunk in chunks)
+                    set(
+                        chunk.source
+                        for chunk in chunks
+                    )
                 ),
                 "documents_directory": docs_dir,
                 "embedding_model": (
@@ -1007,7 +1065,9 @@ def query():
 
         retrieval_start = time.perf_counter()
 
-        diagnostics = _state["retriever"].search_with_diagnostics(
+        diagnostics = _state[
+            "retriever"
+        ].search_with_diagnostics(
             question,
             top_k=retrieval_top_k,
             candidate_pool=candidate_pool,
@@ -1025,7 +1085,7 @@ def query():
             _select_content_aware_results(
                 diagnostics["results"],
                 store,
-                top_k,
+                retrieval_top_k,
                 question,
             )
         )
@@ -1040,7 +1100,9 @@ def query():
             ),
         )
 
-        selected_results = reranked_results[:top_k]
+        selected_results = (
+            reranked_results[:top_k]
+        )
 
         hits = [
             _serialize_hit(
@@ -1073,24 +1135,44 @@ def query():
             "results": hits,
             "sources": _build_sources(hits),
             "retrieval": {
-                "fusion_method": diagnostics["fusion_method"],
+                "fusion_method": diagnostics[
+                    "fusion_method"
+                ],
                 "alpha": diagnostics["alpha"],
                 "rrf_k": diagnostics["rrf_k"],
-                "candidate_pool": diagnostics["candidate_pool"],
+                "candidate_pool": diagnostics[
+                    "candidate_pool"
+                ],
                 "top_k": top_k,
                 "raw_top_k": retrieval_top_k,
-                "min_score": diagnostics["min_score"],
-                "bm25_candidates": diagnostics["bm25_candidates"],
-                "dense_candidates": diagnostics["dense_candidates"],
-                "fused_candidates": diagnostics["fused_candidates"],
+                "min_score": diagnostics[
+                    "min_score"
+                ],
+                "bm25_candidates": diagnostics[
+                    "bm25_candidates"
+                ],
+                "dense_candidates": diagnostics[
+                    "dense_candidates"
+                ],
+                "fused_candidates": diagnostics[
+                    "fused_candidates"
+                ],
                 "raw_results_after_threshold": (
-                    diagnostics["results_after_threshold"]
+                    diagnostics[
+                        "results_after_threshold"
+                    ]
                 ),
-                "raw_final_results": diagnostics["final_results"],
-                "content_aware_filtering": content_filter,
+                "raw_final_results": diagnostics[
+                    "final_results"
+                ],
+                "content_aware_filtering": (
+                    content_filter
+                ),
                 "reranking": {
                     "enabled": True,
-                    "method": "query-aware-deterministic",
+                    "method": (
+                        "query-aware-deterministic"
+                    ),
                     "candidate_count": len(
                         reranked_results
                     ),
@@ -1104,7 +1186,9 @@ def query():
         }
 
         if generate:
-            generation_start = time.perf_counter()
+            generation_start = (
+                time.perf_counter()
+            )
 
             contexts = [
                 {
@@ -1127,9 +1211,12 @@ def query():
             )
 
             response["answer"] = answer
+
             response["generation"].update(
                 {
-                    "context_count": len(contexts),
+                    "context_count": len(
+                        contexts
+                    ),
                     "generation_time_seconds": round(
                         generation_time,
                         4,

@@ -53,9 +53,7 @@ _STOPWORDS = {
 
 
 def _tokenize(text: str) -> List[str]:
-    """
-    Tokenize text into lowercase alphanumeric terms.
-    """
+    """Tokenize text into lowercase alphanumeric terms."""
 
     if not text:
         return []
@@ -67,9 +65,7 @@ def _tokenize(text: str) -> List[str]:
 
 
 def _query_terms(query: str) -> List[str]:
-    """
-    Return meaningful query terms with common stopwords removed.
-    """
+    """Return meaningful query terms with common stopwords removed."""
 
     return [
         token
@@ -162,9 +158,7 @@ def _safe_float(
     value,
     default: float = 0.0,
 ) -> float:
-    """
-    Safely convert a value to float.
-    """
+    """Safely convert a value to float."""
 
     try:
         return float(value)
@@ -175,9 +169,7 @@ def _safe_float(
 def _bounded_score(
     value: float,
 ) -> float:
-    """
-    Clamp a numeric score to the range [0.0, 1.0].
-    """
+    """Clamp a numeric score to the range [0.0, 1.0]."""
 
     return max(
         0.0,
@@ -193,9 +185,7 @@ def _score_result(
     query: str,
     text: str,
 ) -> Dict:
-    """
-    Calculate deterministic reranking features.
-    """
+    """Calculate deterministic reranking features."""
 
     terms = _query_terms(query)
 
@@ -228,8 +218,7 @@ def _score_result(
     )
 
     # BM25 values are document/query dependent.
-    # Convert them into a bounded saturation score instead of
-    # allowing unusually large BM25 values to dominate.
+    # Convert them into a bounded saturation score.
     bm25_component = (
         bm25_score
         / (bm25_score + 10.0)
@@ -242,10 +231,28 @@ def _score_result(
     )
 
     # Dense cosine similarity is expected to be approximately
-    # within the [-1, 1] range. For this retrieval pipeline,
-    # positive similarity is the useful signal.
+    # within the [-1, 1] range. Positive similarity is useful.
     dense_component = _bounded_score(
         dense_score
+    )
+
+    # Content type is supplied by the API retrieval layer.
+    metadata = result.get("metadata") or {}
+
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    content_type = str(
+        metadata.get("content_type", "")
+    ).lower()
+
+    # Bibliography/reference chunks can contain many exact query
+    # terms and therefore receive artificially high lexical scores.
+    # Penalize them for normal factual queries.
+    bibliography_penalty = (
+        0.20
+        if content_type == "bibliography"
+        else 0.0
     )
 
     # Deterministic lightweight reranking:
@@ -256,15 +263,15 @@ def _score_result(
     # Overlap   -> direct query-term relevance
     # Phrase    -> direct multi-word phrase relevance
     #
-    # Query overlap is deliberately strong enough to move generic
-    # semantic matches below passages containing the actual concepts
-    # requested by the user.
+    # Bibliography penalty prevents reference-list chunks from
+    # outranking actual explanatory content.
     rerank_score = (
         0.30 * rrf_component
         + 0.15 * bm25_component
         + 0.15 * dense_component
         + 0.30 * overlap
         + 0.10 * phrase
+        - bibliography_penalty
     )
 
     return {
@@ -338,9 +345,15 @@ def rerank(
     reranked.sort(
         key=lambda item: (
             -item["rerank_score"],
-            -_safe_float(item.get("score", 0.0)),
-            -_safe_float(item.get("dense_score", 0.0)),
-            -_safe_float(item.get("bm25_score", 0.0)),
+            -_safe_float(
+                item.get("score", 0.0)
+            ),
+            -_safe_float(
+                item.get("dense_score", 0.0)
+            ),
+            -_safe_float(
+                item.get("bm25_score", 0.0)
+            ),
             item.get("chunk_id", ""),
         )
     )
