@@ -8,6 +8,7 @@ Supports:
 - Reciprocal Rank Fusion (RRF)
 - Candidate pools
 - Minimum score filtering
+- Content-aware retrieval adjustment
 - Deterministic ranking
 - Retrieval diagnostics
 """
@@ -47,9 +48,29 @@ class HybridRetriever:
     alpha:
         Dense weight for weighted fusion.
         BM25 weight = 1 - alpha.
+
+    docstore:
+        Optional DocStore used for content-aware retrieval.
     """
 
     VALID_FUSION_METHODS = {"rrf", "weighted"}
+
+    # Bibliography is useful for explicit reference questions,
+    # but normally creates noise for factual/explanatory questions.
+    BIBLIOGRAPHY_SCORE_FACTOR = 0.25
+
+    REFERENCE_QUERY_TERMS = {
+        "reference",
+        "references",
+        "bibliography",
+        "citation",
+        "citations",
+        "cited",
+        "author",
+        "authors",
+        "arxiv",
+        "doi",
+    }
 
     def __init__(
         self,
@@ -58,6 +79,7 @@ class HybridRetriever:
         alpha: float = 0.5,
         fusion_method: str = "rrf",
         rrf_k: int = 60,
+        docstore=None,
     ):
         if not 0.0 <= alpha <= 1.0:
             raise ValueError(
@@ -81,6 +103,7 @@ class HybridRetriever:
         self.alpha = alpha
         self.fusion_method = fusion_method
         self.rrf_k = rrf_k
+        self.docstore = docstore
 
     def _weighted_fusion(
         self,
@@ -119,7 +142,6 @@ class HybridRetriever:
                 }
             )
 
-        # Deterministic ordering.
         fused.sort(
             key=lambda item: (
                 -item["score"],
@@ -149,7 +171,6 @@ class HybridRetriever:
         bm25_hits = dict(bm25_results)
         dense_hits = dict(dense_results)
 
-        # BM25 ranking.
         for rank, (chunk_id, _) in enumerate(
             bm25_results,
             start=1,
@@ -159,7 +180,6 @@ class HybridRetriever:
                 + 1.0 / (self.rrf_k + rank)
             )
 
-        # Dense ranking.
         for rank, (chunk_id, _) in enumerate(
             dense_results,
             start=1,
@@ -187,7 +207,6 @@ class HybridRetriever:
                 }
             )
 
-        # Deterministic ordering.
         fused.sort(
             key=lambda item: (
                 -item["score"],
@@ -198,6 +217,88 @@ class HybridRetriever:
         )
 
         return fused
+
+    @classmethod
+    def _is_reference_query(cls, query: str) -> bool:
+        """Return True when the query explicitly asks about references."""
+        query_terms = set(query.lower().split())
+        return bool(query_terms & cls.REFERENCE_QUERY_TERMS)
+
+    def _get_content_type(self, chunk_id: str) -> str:
+        """
+        Return the content type for a chunk.
+
+        Missing metadata is treated as normal content so that
+        existing indexes remain fully compatible.
+        """
+        if self.docstore is None:
+            return "content"
+
+        chunks = getattr(self.docstore, "chunks", None)
+
+        if not isinstance(chunks, dict):
+            return "content"
+
+        chunk = chunks.get(chunk_id)
+
+        if chunk is None:
+            return "content"
+
+        metadata = getattr(chunk, "metadata", None)
+
+        if not isinstance(metadata, dict):
+            return "content"
+
+        return metadata.get("content_type", "content")
+
+    def _apply_content_type_adjustment(
+        self,
+        query: str,
+        results: List[Dict],
+    ) -> List[Dict]:
+        """
+        Reduce bibliography noise for normal questions.
+
+        Bibliography chunks remain fully retrievable when the user
+        explicitly asks about references, citations, authors, etc.
+        """
+        if not results:
+            return results
+
+        # Reference-oriented questions should retain bibliography
+        # results without penalty.
+        if self._is_reference_query(query):
+            return results
+
+        adjusted = []
+
+        for result in results:
+            updated = dict(result)
+
+            content_type = self._get_content_type(
+                result["chunk_id"]
+            )
+
+            updated["content_type"] = content_type
+
+            if content_type == "bibliography":
+                updated["score"] = float(
+                    result["score"]
+                    * self.BIBLIOGRAPHY_SCORE_FACTOR
+                )
+
+            adjusted.append(updated)
+
+        adjusted.sort(
+            key=lambda item: (
+                -item["score"],
+                -item["dense_score"],
+                -item["bm25_score"],
+                item["chunk_id"],
+            )
+        )
+
+        return adjusted
 
     @staticmethod
     def _validate_parameters(
@@ -238,55 +339,29 @@ class HybridRetriever:
                     f"min_score must be >= 0.0, got {min_score}"
                 )
 
-    def search(
+    def _fuse(
         self,
-        query: str,
-        top_k: int = 5,
-        candidate_pool: int = 50,
-        min_score: Optional[float] = None,
+        bm25_results: List,
+        dense_results: List,
     ) -> List[Dict]:
-        """
-        Retrieve and fuse BM25 + dense results.
+        """Fuse BM25 and dense rankings using the configured method."""
+        if self.fusion_method == "rrf":
+            return self._rrf_fusion(
+                bm25_results,
+                dense_results,
+            )
 
-        Parameters
-        ----------
-        query:
-            User query.
-
-        top_k:
-            Number of final results.
-
-        candidate_pool:
-            Number of candidates retrieved from each
-            retrieval system before fusion.
-
-        min_score:
-            Optional minimum fused score.
-
-            None disables threshold filtering.
-
-        Returns
-        -------
-        List[Dict]
-            Each result contains:
-
-            {
-                "chunk_id": str,
-                "score": float,
-                "bm25_score": float,
-                "dense_score": float,
-                "retrieved_by_bm25": bool,
-                "retrieved_by_dense": bool
-            }
-        """
-        self._validate_parameters(
-            query=query,
-            top_k=top_k,
-            candidate_pool=candidate_pool,
-            min_score=min_score,
+        return self._weighted_fusion(
+            dict(bm25_results),
+            dict(dense_results),
         )
 
-        # Retrieve candidates independently.
+    def _retrieve_and_fuse(
+        self,
+        query: str,
+        candidate_pool: int,
+    ):
+        """Retrieve candidates and perform fusion."""
         bm25_results = self.bm25_index.search(
             query,
             candidate_pool,
@@ -297,23 +372,48 @@ class HybridRetriever:
             candidate_pool,
         )
 
-        # Handle empty indexes safely.
+        fused = self._fuse(
+            bm25_results,
+            dense_results,
+        )
+
+        return bm25_results, dense_results, fused
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        candidate_pool: int = 50,
+        min_score: Optional[float] = None,
+    ) -> List[Dict]:
+        """
+        Retrieve and fuse BM25 + dense results.
+        """
+        self._validate_parameters(
+            query=query,
+            top_k=top_k,
+            candidate_pool=candidate_pool,
+            min_score=min_score,
+        )
+
+        bm25_results, dense_results, fused = (
+            self._retrieve_and_fuse(
+                query,
+                candidate_pool,
+            )
+        )
+
         if not bm25_results and not dense_results:
             return []
 
-        # Fuse rankings.
-        if self.fusion_method == "rrf":
-            fused = self._rrf_fusion(
-                bm25_results,
-                dense_results,
-            )
-        else:
-            fused = self._weighted_fusion(
-                dict(bm25_results),
-                dict(dense_results),
-            )
+        # Apply content-aware adjustment BEFORE final top-k.
+        # This allows a strong non-bibliography candidate outside
+        # the original top-k to move into the final result set.
+        fused = self._apply_content_type_adjustment(
+            query,
+            fused,
+        )
 
-        # Optional threshold filtering.
         if min_score is not None:
             fused = [
                 result
@@ -321,7 +421,6 @@ class HybridRetriever:
                 if result["score"] >= min_score
             ]
 
-        # Final top-k.
         return fused[:top_k]
 
     def search_with_diagnostics(
@@ -333,8 +432,6 @@ class HybridRetriever:
     ) -> Dict:
         """
         Execute retrieval and return results plus diagnostics.
-
-        Useful for the future API and visual RAG frontend.
         """
         self._validate_parameters(
             query=query,
@@ -343,28 +440,19 @@ class HybridRetriever:
             min_score=min_score,
         )
 
-        bm25_results = self.bm25_index.search(
-            query,
-            candidate_pool,
+        bm25_results, dense_results, fused = (
+            self._retrieve_and_fuse(
+                query,
+                candidate_pool,
+            )
         )
 
-        dense_results = self.embedding_index.search(
+        pre_adjustment_count = len(fused)
+
+        fused = self._apply_content_type_adjustment(
             query,
-            candidate_pool,
+            fused,
         )
-
-        if self.fusion_method == "rrf":
-            fused = self._rrf_fusion(
-                bm25_results,
-                dense_results,
-            )
-        else:
-            fused = self._weighted_fusion(
-                dict(bm25_results),
-                dict(dense_results),
-            )
-
-        pre_threshold_count = len(fused)
 
         if min_score is not None:
             fused = [
@@ -374,6 +462,12 @@ class HybridRetriever:
             ]
 
         final_results = fused[:top_k]
+
+        bibliography_candidates = sum(
+            1
+            for result in final_results
+            if result.get("content_type") == "bibliography"
+        )
 
         return {
             "query": query,
@@ -385,8 +479,10 @@ class HybridRetriever:
             "min_score": min_score,
             "bm25_candidates": len(bm25_results),
             "dense_candidates": len(dense_results),
-            "fused_candidates": pre_threshold_count,
+            "fused_candidates": pre_adjustment_count,
             "results_after_threshold": len(fused),
             "final_results": len(final_results),
+            "bibliography_results": bibliography_candidates,
+            "reference_query": self._is_reference_query(query),
             "results": final_results,
         }

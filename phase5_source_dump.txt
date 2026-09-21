@@ -1,0 +1,2344 @@
+
+============================================================
+FILE: .\app.py
+============================================================
+"""
+Flask REST API for the Enterprise RAG Platform.
+
+Endpoints:
+    GET  /health
+    POST /ingest
+    POST /query
+
+The /query endpoint supports:
+    - hybrid retrieval
+    - configurable top-k
+    - candidate pools
+    - minimum score threshold
+    - retrieval diagnostics
+    - grounded LLM generation
+    - source/page/slide metadata
+"""
+
+import os
+import time
+import traceback
+
+from flask import Flask, request, jsonify
+
+from src import config
+from src.bm25_index import BM25Index
+from src.embedding_index import EmbeddingIndex, default_encode_fn
+from src.docstore import DocStore
+from src.hybrid_retriever import HybridRetriever
+from src.chunking import build_chunks_from_dir
+from src.llm_client import generate_answer
+
+
+app = Flask(__name__)
+
+
+_state = {
+    "bm25": None,
+    "embed": None,
+    "store": None,
+    "retriever": None,
+}
+
+
+def _indexes_exist() -> bool:
+    """Return True when all persisted indexes exist."""
+
+    return (
+        os.path.exists(config.BM25_INDEX_PATH)
+        and os.path.exists(config.EMBED_INDEX_PATH)
+        and os.path.exists(config.DOCSTORE_PATH)
+    )
+
+
+def _create_retriever(
+    bm25,
+    embed,
+):
+    """Create the application's configured hybrid retriever."""
+
+    return HybridRetriever(
+        bm25_index=bm25,
+        embedding_index=embed,
+        alpha=config.HYBRID_ALPHA,
+        fusion_method="weighted",
+    )
+
+
+def _load_state():
+    """Load persisted indexes into memory."""
+
+    encode_fn = default_encode_fn(
+        config.EMBEDDING_MODEL_NAME
+    )
+
+    bm25 = BM25Index.load(
+        config.BM25_INDEX_PATH
+    )
+
+    embed = EmbeddingIndex.load(
+        config.EMBED_INDEX_PATH,
+        encode_fn=encode_fn,
+    )
+
+    store = DocStore.load(
+        config.DOCSTORE_PATH
+    )
+
+    retriever = _create_retriever(
+        bm25,
+        embed,
+    )
+
+    _state.update(
+        {
+            "bm25": bm25,
+            "embed": embed,
+            "store": store,
+            "retriever": retriever,
+        }
+    )
+
+
+def _ensure_loaded():
+    """Load indexes when necessary."""
+
+    if _state["retriever"] is not None:
+        return
+
+    if not _indexes_exist():
+        raise RuntimeError(
+            "No indexes found. Run `python ingest.py` first, "
+            "or POST /ingest."
+        )
+
+    _load_state()
+
+
+def _safe_int(
+    value,
+    default,
+    minimum=1,
+):
+    """Safely parse an integer request parameter."""
+
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+
+    return max(parsed, minimum)
+
+
+def _safe_float_or_none(value):
+    """Parse an optional float."""
+
+    if value is None:
+        return None
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "min_score must be a valid number"
+        )
+
+
+def _serialize_hit(result, store):
+    """Convert an internal retrieval result into API output."""
+
+    chunk_id = result["chunk_id"]
+    chunk = store.get(chunk_id)
+
+    if chunk is None:
+        return {
+            "chunk_id": chunk_id,
+            "source": None,
+            "text": None,
+            "metadata": {},
+            "score": round(result["score"], 6),
+            "bm25_score": round(
+                result["bm25_score"],
+                6,
+            ),
+            "dense_score": round(
+                result["dense_score"],
+                6,
+            ),
+            "retrieved_by_bm25": result.get(
+                "retrieved_by_bm25",
+                False,
+            ),
+            "retrieved_by_dense": result.get(
+                "retrieved_by_dense",
+                False,
+            ),
+        }
+
+    return {
+        "chunk_id": chunk.id,
+        "source": chunk.source,
+        "text": chunk.text,
+        "metadata": dict(chunk.metadata or {}),
+        "score": round(result["score"], 6),
+        "bm25_score": round(
+            result["bm25_score"],
+            6,
+        ),
+        "dense_score": round(
+            result["dense_score"],
+            6,
+        ),
+        "retrieved_by_bm25": result.get(
+            "retrieved_by_bm25",
+            False,
+        ),
+        "retrieved_by_dense": result.get(
+            "retrieved_by_dense",
+            False,
+        ),
+    }
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Application health check."""
+
+    return jsonify(
+        {
+            "status": "ok",
+            "indexes_loaded": (
+                _state["retriever"] is not None
+            ),
+            "llm_provider": config.LLM_PROVIDER,
+            "embedding_model": config.EMBEDDING_MODEL_NAME,
+        }
+    )
+
+
+@app.route("/ingest", methods=["POST"])
+def ingest():
+    """Build BM25, dense embedding, and document-store indexes."""
+
+    start_time = time.perf_counter()
+
+    try:
+        if request.is_json:
+            body = request.get_json(silent=True) or {}
+            docs_dir = body.get(
+                "docs_dir",
+                config.DOCS_DIR,
+            )
+        else:
+            docs_dir = config.DOCS_DIR
+
+        if not isinstance(docs_dir, str) or not docs_dir.strip():
+            return jsonify(
+                {"error": "docs_dir must be a non-empty string"}
+            ), 400
+
+        if not os.path.isdir(docs_dir):
+            return jsonify(
+                {
+                    "error": (
+                        f"Document directory does not exist: "
+                        f"{docs_dir}"
+                    )
+                }
+            ), 400
+
+        chunks = build_chunks_from_dir(
+            docs_dir,
+            config.CHUNK_SIZE,
+            config.CHUNK_OVERLAP,
+        )
+
+        if not chunks:
+            return jsonify(
+                {
+                    "error": (
+                        f"No supported documents found in {docs_dir}. "
+                        "Supported formats: TXT, MD, PDF, DOCX, PPTX."
+                    )
+                }
+            ), 400
+
+        chunk_ids = [
+            chunk.id
+            for chunk in chunks
+        ]
+
+        texts = [
+            chunk.text
+            for chunk in chunks
+        ]
+
+        # BM25
+        bm25 = BM25Index()
+
+        bm25.build(
+            chunk_ids,
+            texts,
+        )
+
+        bm25.save(
+            config.BM25_INDEX_PATH
+        )
+
+        # Dense embeddings
+        encode_fn = default_encode_fn(
+            config.EMBEDDING_MODEL_NAME
+        )
+
+        embed = EmbeddingIndex(
+            encode_fn=encode_fn
+        )
+
+        embed.build(
+            chunk_ids,
+            texts,
+        )
+
+        embed.save(
+            config.EMBED_INDEX_PATH
+        )
+
+        # Document store
+        store = DocStore()
+
+        store.add(chunks)
+
+        store.save(
+            config.DOCSTORE_PATH
+        )
+
+        # Runtime retriever
+        retriever = _create_retriever(
+            bm25,
+            embed,
+        )
+
+        _state.update(
+            {
+                "bm25": bm25,
+                "embed": embed,
+                "store": store,
+                "retriever": retriever,
+            }
+        )
+
+        elapsed = time.perf_counter() - start_time
+
+        return jsonify(
+            {
+                "status": "ok",
+                "chunks_indexed": len(chunks),
+                "documents_directory": docs_dir,
+                "embedding_model": (
+                    config.EMBEDDING_MODEL_NAME
+                ),
+                "fusion_method": "weighted",
+                "elapsed_seconds": round(
+                    elapsed,
+                    3,
+                ),
+            }
+        )
+
+    except Exception as e:
+        app.logger.error(
+            traceback.format_exc()
+        )
+
+        return jsonify(
+            {"error": str(e)}
+        ), 500
+
+
+@app.route("/query", methods=["POST"])
+def query():
+    """Retrieve context and optionally generate a grounded answer."""
+
+    request_start = time.perf_counter()
+
+    try:
+        if not request.is_json:
+            return jsonify(
+                {
+                    "error": "Request body must be JSON"
+                }
+            ), 400
+
+        body = request.get_json(
+            silent=True
+        )
+
+        if not isinstance(body, dict):
+            return jsonify(
+                {
+                    "error": "Request body must be a JSON object"
+                }
+            ), 400
+
+        question = body.get("question")
+
+        if (
+            not isinstance(question, str)
+            or not question.strip()
+        ):
+            return jsonify(
+                {
+                    "error": "'question' is required"
+                }
+            ), 400
+
+        top_k = _safe_int(
+            body.get(
+                "top_k",
+                config.TOP_K,
+            ),
+            config.TOP_K,
+            minimum=1,
+        )
+
+        candidate_pool = _safe_int(
+            body.get(
+                "candidate_pool",
+                max(config.TOP_K, 50),
+            ),
+            max(config.TOP_K, 50),
+            minimum=1,
+        )
+
+        if top_k > candidate_pool:
+            candidate_pool = top_k
+
+        min_score = _safe_float_or_none(
+            body.get("min_score")
+        )
+
+        generate = bool(
+            body.get(
+                "generate",
+                False,
+            )
+        )
+
+        _ensure_loaded()
+
+        retrieval_start = time.perf_counter()
+
+        diagnostics = (
+            _state["retriever"]
+            .search_with_diagnostics(
+                question,
+                top_k=top_k,
+                candidate_pool=candidate_pool,
+                min_score=min_score,
+            )
+        )
+
+        retrieval_time = (
+            time.perf_counter()
+            - retrieval_start
+        )
+
+        store = _state["store"]
+
+        hits = [
+            _serialize_hit(
+                result,
+                store,
+            )
+            for result in diagnostics["results"]
+        ]
+
+        response = {
+            "question": question,
+            "results": hits,
+            "retrieval": {
+                "fusion_method": (
+                    diagnostics["fusion_method"]
+                ),
+                "alpha": diagnostics["alpha"],
+                "rrf_k": diagnostics["rrf_k"],
+                "candidate_pool": (
+                    diagnostics["candidate_pool"]
+                ),
+                "top_k": diagnostics["requested_top_k"],
+                "min_score": (
+                    diagnostics["min_score"]
+                ),
+                "bm25_candidates": (
+                    diagnostics["bm25_candidates"]
+                ),
+                "dense_candidates": (
+                    diagnostics["dense_candidates"]
+                ),
+                "fused_candidates": (
+                    diagnostics["fused_candidates"]
+                ),
+                "results_after_threshold": (
+                    diagnostics[
+                        "results_after_threshold"
+                    ]
+                ),
+                "final_results": (
+                    diagnostics["final_results"]
+                ),
+                "retrieval_time_seconds": round(
+                    retrieval_time,
+                    4,
+                ),
+            },
+        }
+
+        if generate:
+            generation_start = time.perf_counter()
+
+            # Only send useful retrieved context to the LLM.
+            contexts = [
+                {
+                    "text": hit["text"],
+                    "source": hit["source"],
+                    "metadata": hit["metadata"],
+                }
+                for hit in hits
+                if hit.get("text")
+            ]
+
+            answer = generate_answer(
+                question,
+                contexts,
+            )
+
+            generation_time = (
+                time.perf_counter()
+                - generation_start
+            )
+
+            response["answer"] = answer
+            response["generation"] = {
+                "provider": config.LLM_PROVIDER,
+                "model": config.LLM_MODEL,
+                "context_count": len(contexts),
+                "generation_time_seconds": round(
+                    generation_time,
+                    4,
+                ),
+            }
+
+        response["total_time_seconds"] = round(
+            time.perf_counter()
+            - request_start,
+            4,
+        )
+
+        return jsonify(response)
+
+    except ValueError as e:
+        return jsonify(
+            {"error": str(e)}
+        ), 400
+
+    except RuntimeError as e:
+        return jsonify(
+            {"error": str(e)}
+        ), 400
+
+    except Exception as e:
+        app.logger.error(
+            traceback.format_exc()
+        )
+
+        return jsonify(
+            {"error": str(e)}
+        ), 500
+
+
+if __name__ == "__main__":
+    port = int(
+        os.environ.get(
+            "PORT",
+            5000,
+        )
+    )
+
+    debug = (
+        os.environ.get(
+            "FLASK_DEBUG",
+            "0",
+        )
+        == "1"
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=debug,
+    )
+
+============================================================
+FILE: .\ingest.py
+============================================================
+"""
+Production ingestion entry point.
+
+Supports:
+    TXT
+    MD
+    PDF
+    DOCX
+    PPTX
+
+The ingestion pipeline:
+    documents
+        -> chunks
+        -> BM25 index
+        -> dense embedding index
+        -> docstore
+
+Usage:
+    python ingest.py
+"""
+
+import sys
+import time
+from collections import Counter
+
+from src import config
+from src.chunking import build_chunks_from_dir
+from src.bm25_index import BM25Index
+from src.embedding_index import EmbeddingIndex, default_encode_fn
+from src.docstore import DocStore
+
+
+def main():
+    start_time = time.perf_counter()
+
+    print("=" * 70)
+    print("ENTERPRISE RAG - MULTI-DOCUMENT INGESTION")
+    print("=" * 70)
+
+    print(f"\nDocument directory : {config.DOCS_DIR}")
+
+    # ---------------------------------------------------------
+    # 1. Load + chunk all supported documents
+    # ---------------------------------------------------------
+    print("\n[1] Loading and chunking documents...")
+
+    chunks = build_chunks_from_dir(
+        config.DOCS_DIR,
+        config.CHUNK_SIZE,
+        config.CHUNK_OVERLAP,
+    )
+
+    if not chunks:
+        print(
+            f"\nERROR: No supported documents found in "
+            f"{config.DOCS_DIR}"
+        )
+        print("Supported formats: TXT, MD, PDF, DOCX, PPTX")
+        sys.exit(1)
+
+    print(f"Chunks created     : {len(chunks)}")
+
+    # ---------------------------------------------------------
+    # 2. Document statistics
+    # ---------------------------------------------------------
+    document_counter = Counter(
+        chunk.source
+        for chunk in chunks
+    )
+
+    extension_counter = Counter()
+
+    for chunk in chunks:
+        source = chunk.source.lower()
+
+        if "." in source:
+            extension = source.rsplit(".", 1)[-1]
+            extension_counter[extension] += 1
+
+    print(f"Documents indexed  : {len(document_counter)}")
+
+    print("\nDocuments:")
+    for source, count in sorted(document_counter.items()):
+        print(f"  - {source}: {count} chunks")
+
+    print("\nFormats:")
+    for extension, count in sorted(extension_counter.items()):
+        print(f"  - .{extension}: {count} chunks")
+
+    # ---------------------------------------------------------
+    # 3. Prepare index data
+    # ---------------------------------------------------------
+    chunk_ids = [chunk.id for chunk in chunks]
+    texts = [chunk.text for chunk in chunks]
+
+    # Safety check: chunk IDs must be unique.
+    if len(chunk_ids) != len(set(chunk_ids)):
+        print("\nERROR: Duplicate chunk IDs detected.")
+        sys.exit(1)
+
+    # ---------------------------------------------------------
+    # 4. Build BM25
+    # ---------------------------------------------------------
+    print("\n[2] Building BM25 index...")
+
+    bm25_start = time.perf_counter()
+
+    bm25 = BM25Index()
+    bm25.build(
+        chunk_ids,
+        texts,
+    )
+    bm25.save(
+        config.BM25_INDEX_PATH
+    )
+
+    bm25_time = time.perf_counter() - bm25_start
+
+    print(
+        f"BM25 complete     : "
+        f"{bm25_time:.3f}s"
+    )
+
+    # ---------------------------------------------------------
+    # 5. Build dense embedding index
+    # ---------------------------------------------------------
+    print("\n[3] Loading embedding model...")
+
+    encode_fn = default_encode_fn(
+        config.EMBEDDING_MODEL_NAME
+    )
+
+    print(
+        f"Embedding model   : "
+        f"{config.EMBEDDING_MODEL_NAME}"
+    )
+
+    print("\n[4] Building dense embedding index...")
+
+    embedding_start = time.perf_counter()
+
+    embedding_index = EmbeddingIndex(
+        encode_fn=encode_fn
+    )
+
+    embedding_index.build(
+        chunk_ids,
+        texts,
+    )
+
+    embedding_index.save(
+        config.EMBED_INDEX_PATH
+    )
+
+    embedding_time = (
+        time.perf_counter()
+        - embedding_start
+    )
+
+    print(
+        f"Dense index done  : "
+        f"{embedding_time:.3f}s"
+    )
+
+    # ---------------------------------------------------------
+    # 6. Save document store
+    # ---------------------------------------------------------
+    print("\n[5] Saving document store...")
+
+    store = DocStore()
+
+    store.add(chunks)
+
+    store.save(
+        config.DOCSTORE_PATH
+    )
+
+    # ---------------------------------------------------------
+    # 7. Final statistics
+    # ---------------------------------------------------------
+    total_time = (
+        time.perf_counter()
+        - start_time
+    )
+
+    print("\n" + "=" * 70)
+    print("INGESTION COMPLETE")
+    print("=" * 70)
+
+    print(f"Documents         : {len(document_counter)}")
+    print(f"Chunks            : {len(chunks)}")
+    print(f"BM25 time         : {bm25_time:.3f}s")
+    print(f"Dense time        : {embedding_time:.3f}s")
+    print(f"Total time        : {total_time:.3f}s")
+    print(f"Index directory   : {config.INDEX_DIR}")
+
+    print("\nIndexed documents:")
+    for source in sorted(document_counter):
+        print(f"  ✓ {source}")
+
+    print("\nReady for multi-document RAG.")
+
+
+if __name__ == "__main__":
+    main()
+
+============================================================
+FILE: .\requirements.txt
+============================================================
+flask==3.0.3
+rank_bm25==0.2.2
+numpy==1.26.4
+sentence-transformers==3.0.1
+torch==2.3.1
+
+# Document loaders
+PyMuPDF==1.24.10
+python-docx==1.1.2
+python-pptx==0.6.23
+
+# Optional - only needed if you set LLM_PROVIDER=anthropic or openai
+anthropic==0.34.2
+openai==1.40.0
+python-dotenv==1.0.1
+google-genai
+
+============================================================
+FILE: .\src\config.py
+============================================================
+"""
+Central configuration for the RAG Platform.
+All tunable parameters live here so nothing is hard-coded deep inside the pipeline.
+"""
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# --- Paths ---
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DOCS_DIR = os.path.join(BASE_DIR, "sample_docs")
+INDEX_DIR = os.path.join(BASE_DIR, "storage")
+BM25_INDEX_PATH = os.path.join(INDEX_DIR, "bm25_index.pkl")
+EMBED_INDEX_PATH = os.path.join(INDEX_DIR, "embed_index.pkl")
+DOCSTORE_PATH = os.path.join(INDEX_DIR, "docstore.pkl")
+
+# --- Chunking ---
+CHUNK_SIZE = 300        # words per chunk
+CHUNK_OVERLAP = 50      # words of overlap between consecutive chunks
+
+# --- Embedding model ---
+# Any sentence-transformers model works. all-MiniLM-L6-v2 is small and fast.
+EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+
+# --- Hybrid search weighting ---
+# final_score = ALPHA * normalized_dense_score + (1 - ALPHA) * normalized_bm25_score
+HYBRID_ALPHA = float(os.environ.get("HYBRID_ALPHA", "0.5"))
+TOP_K = int(os.environ.get("TOP_K", "5"))
+
+# --- LLM generation (optional, used only by /query when generate=true) ---
+# Supports "anthropic", "openai", or "none" (extractive-only, no LLM call).
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "none")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+LLM_MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-4-6")
+
+os.makedirs(INDEX_DIR, exist_ok=True)
+
+============================================================
+FILE: .\src\bm25_index.py
+============================================================
+"""
+BM25 sparse keyword index, built on top of rank_bm25.
+"""
+
+import pickle
+import re
+from typing import List, Tuple
+
+from rank_bm25 import BM25Okapi
+
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+
+
+def tokenize(text: str) -> List[str]:
+    return [t.lower() for t in _TOKEN_RE.findall(text)]
+
+
+class BM25Index:
+    def __init__(self):
+        self.bm25: BM25Okapi = None
+        self.chunk_ids: List[str] = []
+
+    def build(self, chunk_ids: List[str], texts: List[str]):
+        if len(chunk_ids) != len(texts):
+            raise ValueError("chunk_ids and texts must be the same length")
+        tokenized = [tokenize(t) for t in texts]
+        self.bm25 = BM25Okapi(tokenized)
+        self.chunk_ids = list(chunk_ids)
+
+    def search(self, query: str, top_k: int) -> List[Tuple[str, float]]:
+        if self.bm25 is None:
+            return []
+        scores = self.bm25.get_scores(tokenize(query))
+        ranked = sorted(zip(self.chunk_ids, scores), key=lambda x: x[1], reverse=True)
+        return ranked[:top_k]
+
+    def save(self, path: str):
+        with open(path, "wb") as f:
+            pickle.dump({"bm25": self.bm25, "chunk_ids": self.chunk_ids}, f)
+
+    @classmethod
+    def load(cls, path: str) -> "BM25Index":
+        obj = cls()
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        obj.bm25 = data["bm25"]
+        obj.chunk_ids = data["chunk_ids"]
+        return obj
+
+============================================================
+FILE: .\src\embedding_index.py
+============================================================
+"""
+Dense embedding index using sentence-transformers + cosine similarity (numpy).
+
+No external vector DB is required — cosine similarity over a numpy matrix is
+plenty fast for tens of thousands of chunks and keeps the project dependency
+list short. Swap in FAISS/Chroma/Pinecone later by replacing this module's
+internals; the public interface (build/search/save/load) stays the same.
+"""
+
+import pickle
+from typing import List, Tuple, Callable, Optional
+
+import numpy as np
+
+_model_cache = {}
+
+
+def get_embedder(model_name: str):
+    """
+    Lazily loads and caches a sentence-transformers model.
+    Imported inside the function so the rest of the codebase (and its tests)
+    don't require the heavy sentence-transformers/torch dependency to import.
+    """
+    if model_name in _model_cache:
+        return _model_cache[model_name]
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer(model_name)
+    _model_cache[model_name] = model
+    return model
+
+
+def default_encode_fn(model_name: str) -> Callable[[List[str]], np.ndarray]:
+    model = get_embedder(model_name)
+
+    def _encode(texts: List[str]) -> np.ndarray:
+        vecs = model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
+        return _normalize(np.asarray(vecs, dtype=np.float32))
+
+    return _encode
+
+
+def _normalize(matrix: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0] = 1e-10
+    return matrix / norms
+
+
+class EmbeddingIndex:
+    """
+    encode_fn: Callable[[List[str]], np.ndarray] — injected so tests (or
+    alternative embedding providers) can avoid loading a real transformer model.
+    """
+
+    def __init__(self, encode_fn: Optional[Callable[[List[str]], np.ndarray]] = None):
+        self.encode_fn = encode_fn
+        self.chunk_ids: List[str] = []
+        self.matrix: np.ndarray = None
+
+    def build(self, chunk_ids: List[str], texts: List[str]):
+        if len(chunk_ids) != len(texts):
+            raise ValueError("chunk_ids and texts must be the same length")
+        if self.encode_fn is None:
+            raise ValueError("encode_fn was not provided to EmbeddingIndex")
+        self.matrix = self.encode_fn(texts)
+        self.chunk_ids = list(chunk_ids)
+
+    def search(self, query: str, top_k: int) -> List[Tuple[str, float]]:
+        if self.matrix is None or len(self.chunk_ids) == 0:
+            return []
+        q_vec = self.encode_fn([query])[0]
+        sims = self.matrix @ q_vec  # cosine similarity, since rows are normalized
+        ranked_idx = np.argsort(-sims)[:top_k]
+        return [(self.chunk_ids[i], float(sims[i])) for i in ranked_idx]
+
+    def save(self, path: str):
+        with open(path, "wb") as f:
+            pickle.dump({"chunk_ids": self.chunk_ids, "matrix": self.matrix}, f)
+
+    @classmethod
+    def load(cls, path: str, encode_fn=None) -> "EmbeddingIndex":
+        obj = cls(encode_fn=encode_fn)
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        obj.chunk_ids = data["chunk_ids"]
+        obj.matrix = data["matrix"]
+        return obj
+
+============================================================
+FILE: .\src\hybrid_retriever.py
+============================================================
+"""
+Production-grade hybrid retrieval for RAG.
+
+Supports:
+- BM25 lexical retrieval
+- Dense semantic retrieval
+- Weighted min-max fusion
+- Reciprocal Rank Fusion (RRF)
+- Candidate pools
+- Minimum score filtering
+- Deterministic ranking
+- Retrieval diagnostics
+"""
+
+from typing import Dict, List, Optional
+
+from .bm25_index import BM25Index
+from .embedding_index import EmbeddingIndex
+
+
+def _minmax_normalize(scores: Dict[str, float]) -> Dict[str, float]:
+    """Normalize scores to [0, 1]."""
+    if not scores:
+        return {}
+
+    values = list(scores.values())
+    lo = min(values)
+    hi = max(values)
+
+    if hi - lo < 1e-12:
+        return {key: 1.0 for key in scores}
+
+    return {
+        key: (value - lo) / (hi - lo)
+        for key, value in scores.items()
+    }
+
+
+class HybridRetriever:
+    """
+    Combines BM25 and dense retrieval.
+
+    fusion_method:
+        "rrf"      -> Reciprocal Rank Fusion
+        "weighted" -> min-max weighted fusion
+
+    alpha:
+        Dense weight for weighted fusion.
+        BM25 weight = 1 - alpha.
+    """
+
+    VALID_FUSION_METHODS = {"rrf", "weighted"}
+
+    def __init__(
+        self,
+        bm25_index: BM25Index,
+        embedding_index: EmbeddingIndex,
+        alpha: float = 0.5,
+        fusion_method: str = "rrf",
+        rrf_k: int = 60,
+    ):
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError(
+                f"alpha must be between 0.0 and 1.0, got {alpha}"
+            )
+
+        if fusion_method not in self.VALID_FUSION_METHODS:
+            raise ValueError(
+                f"fusion_method must be one of "
+                f"{sorted(self.VALID_FUSION_METHODS)}, "
+                f"got '{fusion_method}'"
+            )
+
+        if not isinstance(rrf_k, int) or rrf_k <= 0:
+            raise ValueError(
+                f"rrf_k must be a positive integer, got {rrf_k}"
+            )
+
+        self.bm25_index = bm25_index
+        self.embedding_index = embedding_index
+        self.alpha = alpha
+        self.fusion_method = fusion_method
+        self.rrf_k = rrf_k
+
+    def _weighted_fusion(
+        self,
+        bm25_hits: Dict[str, float],
+        dense_hits: Dict[str, float],
+    ) -> List[Dict]:
+        """Fuse BM25 and dense scores using min-max normalization."""
+        bm25_norm = _minmax_normalize(bm25_hits)
+        dense_norm = _minmax_normalize(dense_hits)
+
+        all_ids = set(bm25_norm) | set(dense_norm)
+
+        fused = []
+
+        for chunk_id in all_ids:
+            bm25_normalized = bm25_norm.get(chunk_id, 0.0)
+            dense_normalized = dense_norm.get(chunk_id, 0.0)
+
+            score = (
+                self.alpha * dense_normalized
+                + (1.0 - self.alpha) * bm25_normalized
+            )
+
+            fused.append(
+                {
+                    "chunk_id": chunk_id,
+                    "score": float(score),
+                    "bm25_score": float(
+                        bm25_hits.get(chunk_id, 0.0)
+                    ),
+                    "dense_score": float(
+                        dense_hits.get(chunk_id, 0.0)
+                    ),
+                    "retrieved_by_bm25": chunk_id in bm25_hits,
+                    "retrieved_by_dense": chunk_id in dense_hits,
+                }
+            )
+
+        # Deterministic ordering.
+        fused.sort(
+            key=lambda item: (
+                -item["score"],
+                -item["dense_score"],
+                -item["bm25_score"],
+                item["chunk_id"],
+            )
+        )
+
+        return fused
+
+    def _rrf_fusion(
+        self,
+        bm25_results: List,
+        dense_results: List,
+    ) -> List[Dict]:
+        """
+        Fuse rankings using Reciprocal Rank Fusion.
+
+        RRF contribution:
+            1 / (rrf_k + rank)
+
+        Rank starts at 1.
+        """
+        rrf_scores: Dict[str, float] = {}
+
+        bm25_hits = dict(bm25_results)
+        dense_hits = dict(dense_results)
+
+        # BM25 ranking.
+        for rank, (chunk_id, _) in enumerate(
+            bm25_results,
+            start=1,
+        ):
+            rrf_scores[chunk_id] = (
+                rrf_scores.get(chunk_id, 0.0)
+                + 1.0 / (self.rrf_k + rank)
+            )
+
+        # Dense ranking.
+        for rank, (chunk_id, _) in enumerate(
+            dense_results,
+            start=1,
+        ):
+            rrf_scores[chunk_id] = (
+                rrf_scores.get(chunk_id, 0.0)
+                + 1.0 / (self.rrf_k + rank)
+            )
+
+        fused = []
+
+        for chunk_id, score in rrf_scores.items():
+            fused.append(
+                {
+                    "chunk_id": chunk_id,
+                    "score": float(score),
+                    "bm25_score": float(
+                        bm25_hits.get(chunk_id, 0.0)
+                    ),
+                    "dense_score": float(
+                        dense_hits.get(chunk_id, 0.0)
+                    ),
+                    "retrieved_by_bm25": chunk_id in bm25_hits,
+                    "retrieved_by_dense": chunk_id in dense_hits,
+                }
+            )
+
+        # Deterministic ordering.
+        fused.sort(
+            key=lambda item: (
+                -item["score"],
+                -item["dense_score"],
+                -item["bm25_score"],
+                item["chunk_id"],
+            )
+        )
+
+        return fused
+
+    @staticmethod
+    def _validate_parameters(
+        query: str,
+        top_k: int,
+        candidate_pool: int,
+        min_score: Optional[float],
+    ) -> None:
+        """Validate search parameters."""
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a non-empty string")
+
+        if not isinstance(top_k, int) or top_k <= 0:
+            raise ValueError(
+                f"top_k must be a positive integer, got {top_k}"
+            )
+
+        if not isinstance(candidate_pool, int) or candidate_pool <= 0:
+            raise ValueError(
+                "candidate_pool must be a positive integer, "
+                f"got {candidate_pool}"
+            )
+
+        if top_k > candidate_pool:
+            raise ValueError(
+                f"top_k ({top_k}) cannot be greater than "
+                f"candidate_pool ({candidate_pool})"
+            )
+
+        if min_score is not None:
+            if not isinstance(min_score, (int, float)):
+                raise ValueError(
+                    "min_score must be a number or None"
+                )
+
+            if min_score < 0.0:
+                raise ValueError(
+                    f"min_score must be >= 0.0, got {min_score}"
+                )
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        candidate_pool: int = 50,
+        min_score: Optional[float] = None,
+    ) -> List[Dict]:
+        """
+        Retrieve and fuse BM25 + dense results.
+
+        Parameters
+        ----------
+        query:
+            User query.
+
+        top_k:
+            Number of final results.
+
+        candidate_pool:
+            Number of candidates retrieved from each
+            retrieval system before fusion.
+
+        min_score:
+            Optional minimum fused score.
+
+            None disables threshold filtering.
+
+        Returns
+        -------
+        List[Dict]
+            Each result contains:
+
+            {
+                "chunk_id": str,
+                "score": float,
+                "bm25_score": float,
+                "dense_score": float,
+                "retrieved_by_bm25": bool,
+                "retrieved_by_dense": bool
+            }
+        """
+        self._validate_parameters(
+            query=query,
+            top_k=top_k,
+            candidate_pool=candidate_pool,
+            min_score=min_score,
+        )
+
+        # Retrieve candidates independently.
+        bm25_results = self.bm25_index.search(
+            query,
+            candidate_pool,
+        )
+
+        dense_results = self.embedding_index.search(
+            query,
+            candidate_pool,
+        )
+
+        # Handle empty indexes safely.
+        if not bm25_results and not dense_results:
+            return []
+
+        # Fuse rankings.
+        if self.fusion_method == "rrf":
+            fused = self._rrf_fusion(
+                bm25_results,
+                dense_results,
+            )
+        else:
+            fused = self._weighted_fusion(
+                dict(bm25_results),
+                dict(dense_results),
+            )
+
+        # Optional threshold filtering.
+        if min_score is not None:
+            fused = [
+                result
+                for result in fused
+                if result["score"] >= min_score
+            ]
+
+        # Final top-k.
+        return fused[:top_k]
+
+    def search_with_diagnostics(
+        self,
+        query: str,
+        top_k: int = 5,
+        candidate_pool: int = 50,
+        min_score: Optional[float] = None,
+    ) -> Dict:
+        """
+        Execute retrieval and return results plus diagnostics.
+
+        Useful for the future API and visual RAG frontend.
+        """
+        self._validate_parameters(
+            query=query,
+            top_k=top_k,
+            candidate_pool=candidate_pool,
+            min_score=min_score,
+        )
+
+        bm25_results = self.bm25_index.search(
+            query,
+            candidate_pool,
+        )
+
+        dense_results = self.embedding_index.search(
+            query,
+            candidate_pool,
+        )
+
+        if self.fusion_method == "rrf":
+            fused = self._rrf_fusion(
+                bm25_results,
+                dense_results,
+            )
+        else:
+            fused = self._weighted_fusion(
+                dict(bm25_results),
+                dict(dense_results),
+            )
+
+        pre_threshold_count = len(fused)
+
+        if min_score is not None:
+            fused = [
+                result
+                for result in fused
+                if result["score"] >= min_score
+            ]
+
+        final_results = fused[:top_k]
+
+        return {
+            "query": query,
+            "fusion_method": self.fusion_method,
+            "alpha": self.alpha,
+            "rrf_k": self.rrf_k,
+            "candidate_pool": candidate_pool,
+            "requested_top_k": top_k,
+            "min_score": min_score,
+            "bm25_candidates": len(bm25_results),
+            "dense_candidates": len(dense_results),
+            "fused_candidates": pre_threshold_count,
+            "results_after_threshold": len(fused),
+            "final_results": len(final_results),
+            "results": final_results,
+        }
+
+============================================================
+FILE: .\src\docstore.py
+============================================================
+"""
+Docstore: a plain chunk_id -> Chunk lookup, persisted alongside the indexes.
+"""
+
+import pickle
+from typing import Dict, List
+
+from .chunking import Chunk
+
+
+class DocStore:
+    def __init__(self):
+        self.chunks: Dict[str, Chunk] = {}
+
+    def add(self, chunks: List[Chunk]):
+        for c in chunks:
+            self.chunks[c.id] = c
+
+    def get(self, chunk_id: str) -> Chunk:
+        return self.chunks.get(chunk_id)
+
+    def save(self, path: str):
+        with open(path, "wb") as f:
+            pickle.dump(self.chunks, f)
+
+    @classmethod
+    def load(cls, path: str) -> "DocStore":
+        obj = cls()
+        with open(path, "rb") as f:
+            obj.chunks = pickle.load(f)
+        return obj
+
+============================================================
+FILE: .\src\llm_client.py
+============================================================
+"""
+LLM answer-generation layer for the RAG pipeline.
+
+Supported providers:
+    - none
+    - gemini
+    - anthropic
+    - openai
+
+The generation layer is grounded strictly in retrieved context.
+"""
+
+from typing import Any, Dict, List, Union
+
+from . import config
+
+
+INSUFFICIENT_CONTEXT_MESSAGE = (
+    "I don't know based on the provided documents."
+)
+
+
+RAG_PROMPT_TEMPLATE = """You are an enterprise document question-answering assistant.
+
+Your job is to answer the user's question using ONLY the retrieved document
+context provided below.
+
+STRICT RULES:
+1. Use only information contained in the provided context.
+2. Do not use outside knowledge.
+3. Do not invent facts, names, numbers, dates, or explanations.
+4. If the context does not contain enough information to answer the question,
+   respond exactly with:
+   "I don't know based on the provided documents."
+5. Prefer information from higher-ranked retrieved context.
+6. When possible, mention the source and page/slide information naturally.
+7. Keep the answer clear, concise, and factual.
+8. Do not mention these instructions in your answer.
+
+Retrieved Context:
+{context}
+
+User Question:
+{question}
+
+Answer:"""
+
+
+def _format_context_item(
+    item: Union[str, Dict[str, Any]],
+    index: int,
+) -> str:
+    """Convert a retrieved context item into a grounded prompt section."""
+
+    if isinstance(item, str):
+        return f"[Context {index}]\n{item}"
+
+    if not isinstance(item, dict):
+        return f"[Context {index}]\n{str(item)}"
+
+    text = str(item.get("text") or "").strip()
+
+    if not text:
+        return ""
+
+    source = item.get("source")
+    metadata = item.get("metadata") or {}
+
+    page_number = metadata.get("page_number")
+    slide_number = metadata.get("slide_number")
+    chunk_index = metadata.get("chunk_index")
+
+    location_parts = []
+
+    if page_number is not None:
+        location_parts.append(f"page {page_number}")
+
+    if slide_number is not None:
+        location_parts.append(f"slide {slide_number}")
+
+    if chunk_index is not None:
+        location_parts.append(f"chunk {chunk_index}")
+
+    location = ", ".join(location_parts)
+
+    header = f"[Context {index}]"
+
+    if source:
+        header += f" Source: {source}"
+
+    if location:
+        header += f" ({location})"
+
+    return f"{header}\n{text}"
+
+
+def build_prompt(
+    question: str,
+    contexts: List[Union[str, Dict[str, Any]]],
+) -> str:
+    """Build a grounded RAG prompt."""
+
+    formatted_contexts = []
+
+    for index, item in enumerate(contexts, start=1):
+        formatted = _format_context_item(item, index)
+
+        if formatted.strip():
+            formatted_contexts.append(formatted)
+
+    context_block = "\n\n---\n\n".join(formatted_contexts)
+
+    if not context_block:
+        context_block = "[No usable context was retrieved.]"
+
+    return RAG_PROMPT_TEMPLATE.format(
+        context=context_block,
+        question=question.strip(),
+    )
+
+
+def generate_answer(
+    question: str,
+    contexts: List[Union[str, Dict[str, Any]]],
+) -> str:
+    """
+    Generate a grounded answer using the configured LLM.
+
+    If no usable context exists, generation is skipped.
+    """
+
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("question must be a non-empty string")
+
+    usable_contexts = []
+
+    for item in contexts or []:
+        if isinstance(item, str):
+            if item.strip():
+                usable_contexts.append(item)
+
+        elif isinstance(item, dict):
+            text = item.get("text")
+            if text and str(text).strip():
+                usable_contexts.append(item)
+
+    if not usable_contexts:
+        return INSUFFICIENT_CONTEXT_MESSAGE
+
+    provider = str(config.LLM_PROVIDER or "").lower().strip()
+
+    if provider in {"", "none"}:
+        return (
+            "[No LLM configured - set LLM_PROVIDER=gemini, "
+            "anthropic, or openai to enable generation]"
+        )
+
+    prompt = build_prompt(question, usable_contexts)
+
+    if provider == "gemini":
+        return _generate_gemini(prompt)
+
+    if provider == "anthropic":
+        return _generate_anthropic(prompt)
+
+    if provider == "openai":
+        return _generate_openai(prompt)
+
+    raise ValueError(f"Unknown LLM_PROVIDER: {provider}")
+
+
+def _generate_gemini(prompt: str) -> str:
+    """Generate an answer using Google Gemini."""
+
+    if not config.GEMINI_API_KEY:
+        raise ValueError(
+            "GEMINI_API_KEY is not configured. "
+            "Add your Gemini API key to the .env file."
+        )
+
+    from google import genai
+
+    client = genai.Client(
+        api_key=config.GEMINI_API_KEY
+    )
+
+    response = client.models.generate_content(
+        model=config.LLM_MODEL,
+        contents=prompt,
+    )
+
+    text = getattr(response, "text", None)
+
+    if text:
+        return text.strip()
+
+    return INSUFFICIENT_CONTEXT_MESSAGE
+
+
+def _generate_anthropic(prompt: str) -> str:
+    """Generate an answer using Anthropic Claude."""
+
+    if not config.ANTHROPIC_API_KEY:
+        raise ValueError(
+            "ANTHROPIC_API_KEY is not configured. "
+            "Add your Anthropic API key to the .env file."
+        )
+
+    import anthropic
+
+    client = anthropic.Anthropic(
+        api_key=config.ANTHROPIC_API_KEY
+    )
+
+    response = client.messages.create(
+        model=config.LLM_MODEL,
+        max_tokens=700,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+    )
+
+    text = "".join(
+        block.text
+        for block in response.content
+        if hasattr(block, "text")
+    ).strip()
+
+    return text or INSUFFICIENT_CONTEXT_MESSAGE
+
+
+def _generate_openai(prompt: str) -> str:
+    """Generate an answer using OpenAI."""
+
+    if not config.OPENAI_API_KEY:
+        raise ValueError(
+            "OPENAI_API_KEY is not configured. "
+            "Add your OpenAI API key to the .env file."
+        )
+
+    from openai import OpenAI
+
+    client = OpenAI(
+        api_key=config.OPENAI_API_KEY
+    )
+
+    response = client.chat.completions.create(
+        model=config.LLM_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Answer strictly from the supplied RAG context. "
+                    "Do not invent information."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+        max_tokens=700,
+    )
+
+    text = response.choices[0].message.content
+
+    return (
+        text.strip()
+        if text
+        else INSUFFICIENT_CONTEXT_MESSAGE
+    )
+
+============================================================
+FILE: .\src\chunking.py
+============================================================
+"""
+Document loading + chunking.
+
+Supports TXT, Markdown, PDF, DOCX, and PPTX documents through
+the dedicated loader layer in src/loaders/.
+"""
+
+from dataclasses import dataclass, field
+from typing import List
+import hashlib
+import os
+
+from .loaders import (
+    TextLoader,
+    PDFLoader,
+    DocxLoader,
+    PptxLoader,
+)
+
+
+@dataclass
+class Chunk:
+    id: str
+    text: str
+    source: str
+    chunk_index: int
+    metadata: dict = field(default_factory=dict)
+
+
+def _create_stable_chunk_id(
+    source: str,
+    chunk_index: int,
+    metadata: dict,
+) -> str:
+    """
+    Create a deterministic chunk ID.
+
+    The same document/page/chunk position produces the same ID
+    across repeated index rebuilds.
+    """
+    page_number = metadata.get("page_number", "")
+    slide_number = metadata.get("slide_number", "")
+
+    identity = (
+        f"{source}|"
+        f"page={page_number}|"
+        f"slide={slide_number}|"
+        f"chunk={chunk_index}"
+    )
+
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+
+
+def chunk_text(
+    text: str,
+    source: str,
+    chunk_size: int,
+    overlap: int,
+    metadata: dict = None,
+) -> List[Chunk]:
+    """
+    Split text into overlapping word-based chunks.
+
+    Chunk IDs are deterministic so evaluation and retrieval remain
+    reproducible across index rebuilds.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+
+    if overlap < 0:
+        raise ValueError("overlap must be >= 0")
+
+    if overlap >= chunk_size:
+        raise ValueError("overlap must be smaller than chunk_size")
+
+    words = text.split()
+
+    if not words:
+        return []
+
+    chunks = []
+    start = 0
+    idx = 0
+    step = chunk_size - overlap
+
+    base_metadata = dict(metadata or {})
+
+    while start < len(words):
+        end = min(start + chunk_size, len(words))
+        chunk_words = words[start:end]
+        chunk_str = " ".join(chunk_words)
+
+        chunk_metadata = dict(base_metadata)
+        chunk_metadata["word_count"] = len(chunk_words)
+        chunk_metadata["chunk_index"] = idx
+
+        chunk_id = _create_stable_chunk_id(
+            source=source,
+            chunk_index=idx,
+            metadata=chunk_metadata,
+        )
+
+        chunks.append(
+            Chunk(
+                id=chunk_id,
+                text=chunk_str,
+                source=source,
+                chunk_index=idx,
+                metadata=chunk_metadata,
+            )
+        )
+
+        idx += 1
+
+        if end == len(words):
+            break
+
+        start += step
+
+    return chunks
+
+
+# Reuse loader instances instead of creating them for every file.
+_DOCUMENT_LOADERS = [
+    TextLoader(),
+    PDFLoader(),
+    DocxLoader(),
+    PptxLoader(),
+]
+
+
+def get_document_loaders():
+    """Return all supported document loaders."""
+    return _DOCUMENT_LOADERS
+
+
+def get_loader(file_path: str):
+    """Return the appropriate loader for a file."""
+    for loader in get_document_loaders():
+        if loader.can_load(file_path):
+            return loader
+
+    return None
+
+
+def load_documents(docs_dir: str):
+    """
+    Load all supported documents from a directory.
+
+    Returns a list of LoadedDocument objects.
+    """
+    documents = []
+
+    if not os.path.isdir(docs_dir):
+        return documents
+
+    for fname in sorted(os.listdir(docs_dir)):
+        path = os.path.join(docs_dir, fname)
+
+        if not os.path.isfile(path):
+            continue
+
+        loader = get_loader(path)
+
+        if loader is None:
+            continue
+
+        documents.extend(loader.load(path))
+
+    return documents
+
+
+def build_chunks_from_dir(
+    docs_dir: str,
+    chunk_size: int,
+    overlap: int,
+) -> List[Chunk]:
+    """
+    Load supported documents and convert them into chunks.
+
+    Loader metadata such as PDF page numbers and PPTX slide numbers
+    is preserved in every generated chunk.
+    """
+    all_chunks = []
+
+    for document in load_documents(docs_dir):
+        chunks = chunk_text(
+            document.text,
+            document.source,
+            chunk_size,
+            overlap,
+            metadata=document.metadata,
+        )
+
+        total_chunks = len(chunks)
+
+        for chunk in chunks:
+            chunk.metadata.update(
+                {
+                    "document_name": document.source,
+                    "total_chunks": total_chunks,
+                }
+            )
+
+        all_chunks.extend(chunks)
+
+    return all_chunks
+
+============================================================
+FILE: .\src\loaders\base.py
+============================================================
+"""
+Base abstractions for document loaders.
+
+Each loader converts a supported file format into a normalized
+document representation that the RAG chunking pipeline can consume.
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, List
+from abc import ABC, abstractmethod
+
+
+@dataclass
+class LoadedDocument:
+    """Normalized representation of a loaded document."""
+
+    source: str
+    text: str
+    metadata: Dict = field(default_factory=dict)
+
+
+class DocumentLoader(ABC):
+    """Abstract interface implemented by all document loaders."""
+
+    @abstractmethod
+    def can_load(self, file_path: str) -> bool:
+        """Return True if this loader supports the given file."""
+        pass
+
+    @abstractmethod
+    def load(self, file_path: str) -> List[LoadedDocument]:
+        """Load a file and return normalized documents."""
+        pass
+
+============================================================
+FILE: .\src\loaders\text_loader.py
+============================================================
+"""
+Loader for plain-text and Markdown documents.
+"""
+
+import os
+from typing import List
+
+from .base import DocumentLoader, LoadedDocument
+
+
+class TextLoader(DocumentLoader):
+    """Loads .txt and .md files as normalized documents."""
+
+    SUPPORTED_EXTENSIONS = {".txt", ".md"}
+
+    def can_load(self, file_path: str) -> bool:
+        """Return True if the file is a supported text format."""
+        extension = os.path.splitext(file_path)[1].lower()
+        return extension in self.SUPPORTED_EXTENSIONS
+
+    def load(self, file_path: str) -> List[LoadedDocument]:
+        """Read a text/Markdown file and return one normalized document."""
+        if not self.can_load(file_path):
+            raise ValueError(f"Unsupported text file: {file_path}")
+
+        filename = os.path.basename(file_path)
+
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+
+        return [
+            LoadedDocument(
+                source=filename,
+                text=text,
+                metadata={
+                    "document_name": filename,
+                    "file_type": os.path.splitext(filename)[1]
+                    .lower()
+                    .lstrip("."),
+                },
+            )
+        ]
+
+============================================================
+FILE: .\src\loaders\pdf_loader.py
+============================================================
+"""
+Loader for PDF documents using PyMuPDF.
+"""
+
+import os
+from typing import List
+
+import fitz
+
+from .base import DocumentLoader, LoadedDocument
+
+
+class PDFLoader(DocumentLoader):
+    """Loads PDF files page-by-page."""
+
+    SUPPORTED_EXTENSIONS = {".pdf"}
+
+    def can_load(self, file_path: str) -> bool:
+        """Return True if the file is a PDF."""
+        extension = os.path.splitext(file_path)[1].lower()
+        return extension in self.SUPPORTED_EXTENSIONS
+
+    def load(self, file_path: str) -> List[LoadedDocument]:
+        """Extract text from each PDF page as a separate document."""
+        if not self.can_load(file_path):
+            raise ValueError(f"Unsupported PDF file: {file_path}")
+
+        filename = os.path.basename(file_path)
+        documents = []
+
+        with fitz.open(file_path) as pdf:
+            total_pages = len(pdf)
+
+            for page_number, page in enumerate(pdf, start=1):
+                text = page.get_text("text").strip()
+
+                if not text:
+                    continue
+
+                documents.append(
+                    LoadedDocument(
+                        source=filename,
+                        text=text,
+                        metadata={
+                            "document_name": filename,
+                            "file_type": "pdf",
+                            "page_number": page_number,
+                            "total_pages": total_pages,
+                        },
+                    )
+                )
+
+        return documents
+
+============================================================
+FILE: .\src\loaders\docx_loader.py
+============================================================
+"""
+Loader for Microsoft Word DOCX documents using python-docx.
+"""
+
+import os
+from typing import List
+
+from docx import Document
+
+from .base import DocumentLoader, LoadedDocument
+
+
+class DocxLoader(DocumentLoader):
+    """Loads DOCX files and extracts paragraphs and tables."""
+
+    SUPPORTED_EXTENSIONS = {".docx"}
+
+    def can_load(self, file_path: str) -> bool:
+        """Return True if the file is a DOCX document."""
+        extension = os.path.splitext(file_path)[1].lower()
+        return extension in self.SUPPORTED_EXTENSIONS
+
+    def load(self, file_path: str) -> List[LoadedDocument]:
+        """Extract text from a DOCX file as a normalized document."""
+        if not self.can_load(file_path):
+            raise ValueError(f"Unsupported DOCX file: {file_path}")
+
+        filename = os.path.basename(file_path)
+        document = Document(file_path)
+
+        sections = []
+
+        # Extract paragraphs.
+        for paragraph in document.paragraphs:
+            text = paragraph.text.strip()
+            if text:
+                sections.append(text)
+
+        # Extract tables.
+        for table in document.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                row_text = " | ".join(cell for cell in cells if cell)
+
+                if row_text:
+                    sections.append(row_text)
+
+        text = "\n".join(sections).strip()
+
+        if not text:
+            return []
+
+        return [
+            LoadedDocument(
+                source=filename,
+                text=text,
+                metadata={
+                    "document_name": filename,
+                    "file_type": "docx",
+                },
+            )
+        ]
+
+============================================================
+FILE: .\src\loaders\pptx_loader.py
+============================================================
+"""
+Loader for Microsoft PowerPoint PPTX documents using python-pptx.
+"""
+
+import os
+from typing import List
+
+from pptx import Presentation
+
+from .base import DocumentLoader, LoadedDocument
+
+
+class PptxLoader(DocumentLoader):
+    """Loads PPTX files slide-by-slide."""
+
+    SUPPORTED_EXTENSIONS = {".pptx"}
+
+    def can_load(self, file_path: str) -> bool:
+        """Return True if the file is a PPTX presentation."""
+        extension = os.path.splitext(file_path)[1].lower()
+        return extension in self.SUPPORTED_EXTENSIONS
+
+    def load(self, file_path: str) -> List[LoadedDocument]:
+        """Extract text from each PPTX slide as a normalized document."""
+        if not self.can_load(file_path):
+            raise ValueError(f"Unsupported PPTX file: {file_path}")
+
+        filename = os.path.basename(file_path)
+        presentation = Presentation(file_path)
+
+        documents = []
+        total_slides = len(presentation.slides)
+
+        for slide_number, slide in enumerate(presentation.slides, start=1):
+            slide_text = []
+
+            for shape in slide.shapes:
+                if not hasattr(shape, "text"):
+                    continue
+
+                text = shape.text.strip()
+                if text:
+                    slide_text.append(text)
+
+            text = "\n".join(slide_text).strip()
+
+            if not text:
+                continue
+
+            documents.append(
+                LoadedDocument(
+                    source=filename,
+                    text=text,
+                    metadata={
+                        "document_name": filename,
+                        "file_type": "pptx",
+                        "slide_number": slide_number,
+                        "total_slides": total_slides,
+                    },
+                )
+            )
+
+        return documents
+
+============================================================
+FILE: .\src\loaders\__init__.py
+============================================================
+"""
+Document loader package.
+
+Provides loaders for TXT, Markdown, PDF, DOCX, and PPTX files.
+"""
+
+from .base import DocumentLoader, LoadedDocument
+from .text_loader import TextLoader
+from .pdf_loader import PDFLoader
+from .docx_loader import DocxLoader
+from .pptx_loader import PptxLoader
+
+
+__all__ = [
+    "DocumentLoader",
+    "LoadedDocument",
+    "TextLoader",
+    "PDFLoader",
+    "DocxLoader",
+    "PptxLoader",
+]
+
+============================================================
+FILE: .\tests\test_pipeline.py
+============================================================
+"""
+End-to-end smoke test for the RAG pipeline using a deterministic mock embedder,
+so it runs without downloading any real transformer model (useful for CI /
+offline environments). Run with: python tests/test_pipeline.py
+"""
+
+import sys
+import os
+import hashlib
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.chunking import chunk_text, build_chunks_from_dir
+from src.bm25_index import BM25Index
+from src.embedding_index import EmbeddingIndex, _normalize
+from src.hybrid_retriever import HybridRetriever
+from src.docstore import DocStore
+from src import config
+
+
+def mock_encode_fn(texts):
+    """Deterministic bag-of-words hashing embedding — good enough to prove the
+    plumbing works without needing a real sentence-transformers model."""
+    dim = 64
+    vectors = np.zeros((len(texts), dim), dtype=np.float32)
+    for i, t in enumerate(texts):
+        for word in t.lower().split():
+            h = int(hashlib.md5(word.encode()).hexdigest(), 16) % dim
+            vectors[i, h] += 1.0
+    return _normalize(vectors)
+
+
+def test_chunking():
+    text = "word " * 1000
+    chunks = chunk_text(text.strip(), source="test.txt", chunk_size=300, overlap=50)
+    assert len(chunks) > 1, "expected multiple chunks"
+    assert all(c.source == "test.txt" for c in chunks)
+    print(f"[OK] chunking: {len(chunks)} chunks produced")
+
+
+def test_full_pipeline():
+    chunks = build_chunks_from_dir(config.DOCS_DIR, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
+    assert len(chunks) > 0, "no chunks built from sample_docs"
+
+    chunk_ids = [c.id for c in chunks]
+    texts = [c.text for c in chunks]
+
+    bm25 = BM25Index()
+    bm25.build(chunk_ids, texts)
+
+    embed = EmbeddingIndex(encode_fn=mock_encode_fn)
+    embed.build(chunk_ids, texts)
+
+    store = DocStore()
+    store.add(chunks)
+
+    retriever = HybridRetriever(bm25, embed, alpha=0.5)
+    results = retriever.search("What is BM25 used for in search?", top_k=3)
+
+    assert len(results) > 0, "hybrid search returned no results"
+    top_chunk = store.get(results[0]["chunk_id"])
+    assert top_chunk is not None
+    assert "bm25" in top_chunk.text.lower(), "expected the BM25 chunk to rank highly for a BM25 question"
+    print(f"[OK] hybrid retrieval: top hit from '{top_chunk.source}' (score={results[0]['score']:.3f})")
+
+    # save/load roundtrip
+    bm25.save(os.path.join(config.INDEX_DIR, "test_bm25.pkl"))
+    bm25_loaded = BM25Index.load(os.path.join(config.INDEX_DIR, "test_bm25.pkl"))
+    assert bm25_loaded.search("BM25 ranking function", 3), "reloaded bm25 index returned nothing"
+    print("[OK] bm25 save/load roundtrip")
+
+    embed.save(os.path.join(config.INDEX_DIR, "test_embed.pkl"))
+    embed_loaded = EmbeddingIndex.load(os.path.join(config.INDEX_DIR, "test_embed.pkl"), encode_fn=mock_encode_fn)
+    assert embed_loaded.search("hybrid search embeddings", 3), "reloaded embedding index returned nothing"
+    print("[OK] embedding index save/load roundtrip")
+
+
+def test_flask_api():
+    import app as flask_app_module
+
+    flask_app_module._state["bm25"] = BM25Index()
+    chunks = build_chunks_from_dir(config.DOCS_DIR, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
+    chunk_ids = [c.id for c in chunks]
+    texts = [c.text for c in chunks]
+    flask_app_module._state["bm25"].build(chunk_ids, texts)
+
+    embed = EmbeddingIndex(encode_fn=mock_encode_fn)
+    embed.build(chunk_ids, texts)
+    flask_app_module._state["embed"] = embed
+
+    store = DocStore()
+    store.add(chunks)
+    flask_app_module._state["store"] = store
+
+    flask_app_module._state["retriever"] = HybridRetriever(
+        flask_app_module._state["bm25"], embed, alpha=0.5
+    )
+
+    client = flask_app_module.app.test_client()
+
+    r = client.get("/health")
+    assert r.status_code == 200 and r.get_json()["indexes_loaded"] is True
+    print("[OK] /health endpoint")
+
+    r = client.post("/query", json={"question": "What does Flask do?", "top_k": 2})
+    assert r.status_code == 200
+    data = r.get_json()
+    assert len(data["results"]) > 0
+    print(f"[OK] /query endpoint: {len(data['results'])} results returned")
+
+    r = client.post("/query", json={})
+    assert r.status_code == 400
+    print("[OK] /query correctly rejects missing 'question'")
+
+
+if __name__ == "__main__":
+    test_chunking()
+    test_full_pipeline()
+    test_flask_api()
+    print("\nAll tests passed.")

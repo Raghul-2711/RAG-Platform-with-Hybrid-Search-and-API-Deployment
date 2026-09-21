@@ -36,7 +36,7 @@ def print_chunk_preview(chunk, max_chars=700):
     if len(text) > max_chars:
         text = text[:max_chars] + "..."
 
-    print(f"Page : {chunk.metadata.get('page', 'N/A')}")
+    print(f"Page : {chunk.metadata.get('page_number', 'N/A')}")
     print(f"Text : {text}")
 
 
