@@ -1,146 +1,133 @@
 # RAG Platform with Hybrid Search & API Deployment
 
-A clean, tested rebuild of the hybrid-search RAG project: BM25 (sparse) + sentence-transformer
-embeddings (dense), fused into one ranking, served over a Flask REST API, with optional LLM
-answer generation.
+A retrieval-augmented generation (RAG) system that answers questions from your own documents.
+It combines keyword search (BM25) with semantic search (sentence-transformer embeddings), reranks
+the results, and generates grounded answers with source citations through a Flask REST API and a
+React web interface.
+
+## Features
+
+- **Hybrid retrieval**: BM25 (sparse) + dense embeddings, fused with Reciprocal Rank Fusion (RRF)
+- **Query-aware reranking** and content-aware filtering of retrieved passages
+- **Multi-format ingestion**: `.txt`, `.pdf`, `.docx`, `.pptx` with page / slide metadata
+- **Grounded answers** from an LLM (Gemini, Anthropic or OpenAI) with cited sources
+- **Flask REST API** with request IDs, input validation, structured errors and CORS
+- **React (Vite) frontend**: ask questions, see the answer, sources and retrieved passages
+- **One-click launcher** for Windows (`start_rag.bat`)
 
 ## Architecture
 
 ```
-sample_docs/*.txt  --chunking-->  Chunk objects
-                                       |
-                       -------------------------------
-                       |                             |
-                  BM25Index                    EmbeddingIndex
-               (rank_bm25, keyword)      (sentence-transformers, cosine sim)
-                       |                             |
-                       -------------------------------
-                                       |
-                              HybridRetriever
-                     (min-max normalize + weighted fusion)
-                                       |
-                                  Flask app.py
-                          /query  ->  top-k chunks (+ optional LLM answer)
+documents (txt / pdf / docx / pptx)
+        |  loaders + chunking
+        v
+   Chunk objects  ---------------------------+
+        |                                    |
+   BM25 index                        Embedding index
+  (keyword search)                  (semantic search)
+        |                                    |
+        +----------->  Hybrid retriever (RRF fusion)  <----+
+                               |
+                          Reranker
+                               |
+                        Flask API (app.py)
+                     /query  /ingest  /health
+                               |
+                    React frontend (localhost:5173)
 ```
 
-Each piece is a separate, independently testable module under `src/` — that modularity is what
-was missing in the original repo and is what caused most of its errors (tightly coupled globals,
-no separation between index-building and serving).
+Project layout:
 
-## 1. Setup
+```
+app.py            Flask API
+ingest.py         builds the indexes from sample_docs/
+src/              retrieval pipeline (loaders, chunking, BM25, embeddings, hybrid, reranker, LLM client)
+frontend/         React + Vite web interface
+sample_docs/      put your documents here
+storage/          generated indexes (not committed)
+tests/            pipeline tests
+start_rag.bat     Windows one-click launcher
+```
 
-```bash
-python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
+## Setup
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-cp .env.example .env            # optional — only needed for LLM generation
+cd frontend
+npm install
+cd ..
 ```
 
-## 2. Add your documents
+## Add your documents
 
-Drop `.txt` or `.md` files into `sample_docs/`. Three example files are included so you can test
-immediately without adding anything.
+Put `.txt`, `.pdf`, `.docx` or `.pptx` files in `sample_docs/`, then build the indexes:
 
-## 3. Build the indexes
-
-```bash
+```powershell
 python ingest.py
 ```
 
-This chunks every document (`CHUNK_SIZE=300` words, `CHUNK_OVERLAP=50`, configurable in
-`src/config.py`), builds a BM25 index and a dense embedding index, and writes both plus the
-docstore to `storage/`. The embedding model (`all-MiniLM-L6-v2` by default) downloads from
-Hugging Face the first time you run this — it needs internet access once, then is cached locally.
+The embedding model downloads from Hugging Face the first time, so internet access is needed once.
+Re-run this command whenever you add or change documents.
 
-## 4. Run the API
+## Configure the LLM (for generated answers)
 
-```bash
+Set these environment variables (see `.env.example`):
+
+```powershell
+$env:LLM_PROVIDER = "gemini"            # gemini, anthropic or openai
+$env:LLM_MODEL = "<a model your key supports>"
+$env:GEMINI_API_KEY = "<your key>"      # or ANTHROPIC_API_KEY / OPENAI_API_KEY
+```
+
+Without a provider, the API still returns the retrieved passages, just no generated answer.
+Never commit API keys.
+
+## Run
+
+Backend (terminal 1):
+
+```powershell
 python app.py
 ```
 
-Server starts on `http://localhost:5000`.
+Frontend (terminal 2):
 
-### `GET /health`
-```bash
-curl http://localhost:5000/health
+```powershell
+cd frontend
+npm run dev
 ```
 
-### `POST /query`
-```bash
-curl -X POST http://localhost:5000/query \
-  -H "Content-Type: application/json" \
-  -d '{"question": "What is BM25 used for?", "top_k": 3}'
+Open http://localhost:5173. On Windows you can instead double-click `start_rag.bat`, which starts
+both and opens the browser.
+
+## API
+
+| Method | Route     | Purpose                                              |
+|--------|-----------|------------------------------------------------------|
+| GET    | `/health` | Liveness check                                       |
+| GET    | `/ready`  | Readiness (indexes loaded)                           |
+| GET    | `/status` | Index and configuration details                      |
+| POST   | `/ingest` | Rebuild the indexes without restarting               |
+| POST   | `/query`  | Retrieve passages and optionally generate an answer  |
+
+Example:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:5000/query -H "Content-Type: application/json" -d "{\"question\":\"What is BM25?\",\"top_k\":5,\"generate\":true}"
 ```
 
-Response:
-```json
-{
-  "question": "What is BM25 used for?",
-  "results": [
-    {
-      "chunk_id": "...",
-      "source": "bm25_notes.txt",
-      "text": "BM25 (Best Matching 25) is a ranking function ...",
-      "score": 0.91,
-      "bm25_score": 4.83,
-      "dense_score": 0.77
-    }
-  ]
-}
-```
+The response includes `answer`, `results` (passages with scores), `sources` (file plus page or
+slide), and `retrieval` / timing diagnostics. Set `"generate": true` to get an answer; without it,
+`answer` is `null`.
 
-Add `"generate": true` to also get an LLM-written answer grounded in the retrieved chunks (set
-`LLM_PROVIDER=anthropic` or `openai` and the matching API key in `.env` first — otherwise
-retrieval-only results are returned).
+## Tests
 
-### `POST /ingest`
-Rebuilds the indexes without restarting the server — handy after adding new documents:
-```bash
-curl -X POST http://localhost:5000/ingest
-```
-
-## 5. Run the tests
-
-```bash
+```powershell
 python tests/test_pipeline.py
 ```
 
-This is a full smoke test (chunking → BM25 → embeddings → hybrid fusion → save/load → Flask
-endpoints) that uses a deterministic mock embedder, so it runs in seconds with **no model
-download or API key required** — useful for CI.
+## Tech stack
 
-## 6. Docker
-
-```bash
-docker build -t rag-platform .
-docker run -p 5000:5000 rag-platform
-```
-
-The image builds the indexes at build time (`RUN python ingest.py`), so the container is ready to
-serve as soon as it starts.
-
-## Tuning hybrid search
-
-`HYBRID_ALPHA` in `src/config.py` (or the `HYBRID_ALPHA` env var) controls the BM25/dense blend:
-
-- `1.0` → pure dense/semantic search
-- `0.0` → pure BM25/keyword search
-- `0.5` (default) → balanced hybrid, a reasonable starting point
-
-Raise it toward `1.0` if queries use different wording than your documents (semantic matching
-matters more); lower it toward `0.0` if queries rely on exact keywords, IDs, or jargon that must
-match literally.
-
-## What was fixed vs. a typical broken hybrid-search repo
-
-- **Circular / implicit imports** — every module (`bm25_index`, `embedding_index`,
-  `hybrid_retriever`, `docstore`) is self-contained and only imports what it needs; no global
-  state is created at import time.
-- **Model reload on every request** — `app.py` loads indexes and the embedding model once into
-  `_state`, not per-request.
-- **Score fusion bugs** — raw BM25 scores and cosine similarities live on different scales; they
-  are min-max normalized before being combined, so one score type can't silently dominate.
-- **No error handling** — every endpoint validates its input and returns a proper 4xx with a
-  message instead of a raw 500 stack trace.
-- **Untestable pipeline** — `EmbeddingIndex` takes an injectable `encode_fn`, so the whole
-  retrieval pipeline can be tested without downloading a transformer model or hitting an API.
+Python, Flask, BM25 (rank_bm25), sentence-transformers, PyTorch, Google Gemini API, React, Vite.
