@@ -1,0 +1,20 @@
+﻿* { box-sizing: border-box; }
+
+html, body, #root { min-height: 100vh; margin: 0; }
+
+body {
+  font-family: Inter, system-ui, "Segoe UI", Roboto, sans-serif;
+  background: radial-gradient(circle at 75% 0%, #13233f 0%, #070b14 55%);
+  background-attachment: fixed;
+  color: #e6edf7;
+  -webkit-font-smoothing: antialiased;
+}
+
+#root {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 36px 20px 60px;
+  text-align: left;
+}
+
+button, textarea, input { font: inherit; }

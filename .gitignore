@@ -29,3 +29,12 @@ dist/
 
 # Model/cache files
 .cache/
+# Debug dumps
+project_dump.txt
+phase5_source_dump.txt
+dump.txt
+
+# Large third-party books (keep locally, don't upload)
+sample_docs/*.pdf
+sample_docs/*.pptx
+sample_docs/*.docx
